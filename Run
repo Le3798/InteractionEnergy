@@ -1,0 +1,122 @@
+import os
+import subprocess
+import shutil
+import re
+import sys
+import multiprocessing
+
+total_frames = 10000  # Adjust this number for your total frames
+base_mdp = "rerun.mdp" # Make your own rerun.mdp based on the original mdp file specifing two atom groups to later calculating the interaction energy of
+
+def print_progress_bar(current, total, bar_length=50):
+    percent = float(current) * 100 / total
+    filled_length = int(round(bar_length * current / total))
+    bar = '=' * filled_length + '>' + '-' * (bar_length - filled_length - 1)
+    if current >= total:
+        bar = '=' * bar_length
+    sys.stdout.write(f'\r[{bar}] {percent:.1f}%')
+    sys.stdout.flush()
+
+def process_frame(i):
+    tmp_dir = f"frame_{i:05d}"
+    os.makedirs(tmp_dir, exist_ok=True)
+    energy_line = None
+    
+    try:
+        # 1. Create mdp file
+        with open(base_mdp, "r") as f_in, open(f"{tmp_dir}/rerun_{i}.mdp", "w") as f_out:
+            for line in f_in:
+                # Replace SOL_0 with SOL_{i} in energygrps line
+                if line.strip().startswith("energygrps"):
+                    updated_line = re.sub(r"SOL_0", f"SOL_{i}", line) # if the format in rerun.mdp is energygrps = ACEH_1 SOL_0 (sine SOL_0 changes with frametime)
+                    f_out.write(updated_line)
+                else:
+                    f_out.write(line)
+        
+        # 2. Generate TPR
+        subprocess.run([
+            "gmx", "grompp",
+            "-f", f"{tmp_dir}/rerun_{i}.mdp",
+            "-c", "all.gro",
+            "-n", "index_1.ndx", # specify your index file here
+            "-o", f"{tmp_dir}/rerun_{i}.tpr"
+        ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        
+        # 3. Extract frame
+        subprocess.run([
+            "gmx", "trjconv",
+            "-f", "md.fit.trr",
+            "-s", "md.tpr",
+            "-o", f"{tmp_dir}/{i}.xtc",
+            "-dump", str(i),
+            "-n", "index_1.ndx" # specify your index file here
+        ], check=True, input=b"0\n", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        
+        # 4. Run MD rerun
+        try:
+            subprocess.run(
+                [
+                    "gmx", "mdrun",
+                    "-rerun", f"{i}.xtc",
+                    "-s", f"rerun_{i}.tpr",
+                    "-e", f"rerun_{i}.edr",
+                    "-nt", "1",
+                    "-g", "md.log"
+                ],
+                cwd=tmp_dir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True,
+                check=True
+            )
+        except subprocess.CalledProcessError as e:
+            print(f"\nError in frame {i}:")
+            print(e.stderr)
+            raise
+        
+        # 5. Extract energies
+        subprocess.run([
+            "gmx", "energy",
+            "-f", f"{tmp_dir}/rerun_{i}.edr",
+            "-o", f"{tmp_dir}/energy_{i}.xvg"
+        ], check=True, input=b"16 17\n", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        
+        # 6. Read energy line
+        with open(f"{tmp_dir}/energy_{i}.xvg", "r") as f_in:
+            for line in f_in:
+                if not line.startswith(("#", "@")):
+                    energy_line = line
+                    break
+    
+    finally:
+        shutil.rmtree(tmp_dir)
+    
+    return (i, energy_line)
+
+if __name__ == "__main__":
+    # Initialize output file with header
+    with open("interaction_energies.xvg", "w") as f:
+        f.write("# Time(ps) Coulomb(kJ/mol) Lennard-Jones(kJ/mol)\n")
+    
+    total = total_frames + 1
+    print("Processing frames:")
+    print_progress_bar(0, total)
+
+    # Process frames in parallel
+    with multiprocessing.Pool() as pool:
+        results = []
+        # Use imap_unordered to get results as they complete
+        for count, (i, line) in enumerate(pool.imap_unordered(process_frame, range(total_frames + 1)), 1):
+            results.append((i, line))
+            print_progress_bar(count, total)
+    
+    # Sort results by frame number
+    results.sort(key=lambda x: x[0])
+    
+    # Write sorted results to file
+    with open("interaction_energies.xvg", "a") as f:
+        for i, line in results:
+            if line:
+                f.write(line)
+    
+    print("\nAll frames processed! Results in interaction_energies.xvg")
